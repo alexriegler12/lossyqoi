@@ -21,7 +21,10 @@ typedef struct {
     FILE *file;
     int run;
     qoi_rgba prev_px, index[64];
-    int lossiness; // Only for runs
+    int lossiness;        // Per-pixel tolerance
+    int max_error;        // Maximum allowed accumulated error
+    int current_error[3]; // Track accumulated error (R,G,B)
+	int stoprun;
 } qoi_encoder;
 
 // Write bytes to file (endian-safe)
@@ -30,11 +33,13 @@ static void qoi_write_bytes(FILE *f, const void *data, int size) {
 }
 
 // Initialize encoder
-static void qoi_encoder_init(qoi_encoder *enc, FILE *file, int lossiness) {
+static void qoi_encoder_init(qoi_encoder *enc, FILE *file, int lossiness, int max_error) {
     memset(enc, 0, sizeof(*enc));
     enc->file = file;
     enc->prev_px.a = 255; // Default alpha
     enc->lossiness = lossiness;
+    enc->max_error = max_error;
+	enc->stoprun=0;
 }
 
 // Hash function for color index
@@ -53,21 +58,47 @@ static int qoi_px_near(qoi_rgba a, qoi_rgba b, int threshold) {
 // Write a single pixel (with standard DIFF/LUMA and lossy runs)
 static void qoi_write_pixel(qoi_encoder *enc, qoi_rgba px) {
     // --- Lossy Run Handling ---
-    if (qoi_px_near(px, enc->prev_px, enc->lossiness)) {
-        enc->run++;
-        //if (enc->run == 1) enc->run = 2; // Start run
-        if (enc->run == 62) {
-            uint8_t op = QOI_OP_RUN | 61;
-            qoi_write_bytes(enc->file, &op, 1);
-            enc->run = 0;
-        }
-        return;
-    }
+    if (qoi_px_near(px, enc->prev_px, enc->lossiness)&&!enc->stoprun) {
+        // Calculate and accumulate error
+        int dr = px.r - enc->prev_px.r;
+        int dg = px.g - enc->prev_px.g;
+        int db = px.b - enc->prev_px.b;
+        if(enc->max_error>=0){
+			enc->current_error[0] += abs(dr);
+			enc->current_error[1] += abs(dg);
+			enc->current_error[2] += abs(db);
+        
+        
+        
+			// End run if we reach max length OR exceed error threshold
+			if(enc->current_error[0] > enc->max_error ||
+				enc->current_error[1] > enc->max_error ||
+				enc->current_error[2] > enc->max_error){
+					//enc->prev_px.r=px.r;
+					//enc->prev_px.g=px.g;
+					//enc->prev_px.b=px.b;
+					enc->stoprun=1;
+				
+			}
+		}
+		enc->run++;
+		if (enc->run == 62){
+			uint8_t op = QOI_OP_RUN | (enc->run - 1);
+			qoi_write_bytes(enc->file, &op, 1);
+			enc->run = 0;
+			memset(enc->current_error, 0, sizeof(enc->current_error));
+		}
+		return;
+		
 
+    }
+	if(enc->stoprun=1) enc->stoprun=0;
+    // Flush run if exists
     if (enc->run > 0) {
         uint8_t op = QOI_OP_RUN | (enc->run - 1);
         qoi_write_bytes(enc->file, &op, 1);
         enc->run = 0;
+        memset(enc->current_error, 0, sizeof(enc->current_error));
     }
 
     // --- Standard QOI Encoding ---
@@ -131,7 +162,7 @@ static void qoi_write_footer(qoi_encoder *enc) {
     qoi_write_bytes(enc->file, footer, sizeof(footer));
 }
 
-void convert_to_qoi(const char *input_path, const char *output_path, int lossiness) {
+void convert_to_qoi(const char *input_path, const char *output_path, int lossiness, int max_error) {
     int width, height, channels;
     uint8_t *data = stbi_load(input_path, &width, &height, &channels, 0);
     if (!data) {
@@ -147,7 +178,7 @@ void convert_to_qoi(const char *input_path, const char *output_path, int lossine
     }
 
     qoi_encoder enc;
-    qoi_encoder_init(&enc, out, lossiness);
+    qoi_encoder_init(&enc, out, lossiness, max_error);
     qoi_write_header(&enc, width, height, channels);
 
     for (int i = 0; i < width * height; i++) {
@@ -172,10 +203,11 @@ void convert_to_qoi(const char *input_path, const char *output_path, int lossine
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        printf("Usage: %s <input.png/jpg> <output.qoi> [lossiness=0]\n", argv[0]);
+        printf("Usage: %s <input.png/jpg> <output.qoi> [lossiness=0] [max_error=10]\n", argv[0]);
         return 1;
     }
     int lossiness = (argc > 3) ? atoi(argv[3]) : 0;
-    convert_to_qoi(argv[1], argv[2], lossiness);
+    int max_error = (argc > 4) ? atoi(argv[4]) : 10;
+    convert_to_qoi(argv[1], argv[2], lossiness, max_error);
     return 0;
 }
